@@ -172,6 +172,14 @@
     </div>
 
     <div class="card">
+      <h2>Paste label text</h2>
+      <p class="muted">Copy the nutrition panel text from a product page or a label you've typed, and paste it here. No API key needed. It reads lines like "Protein 5 g" or "Sodium 140 mg". It can't read photos; use the label scanner for those.</p>
+      <textarea id="paste-label" rows="5" style="width:100%;font-size:16px" placeholder="Serving size 1 scoop (30 g) Calories 120 Total Fat 1.5 g Protein 24 g"></textarea>
+      <div class="btn-row"><button class="primary" id="paste-fill">Fill form from text</button></div>
+      <div class="status" id="paste-status"></div>
+    </div>
+
+    <div class="card">
       <h2>Add or edit a food</h2>
       <p class="muted">Enter values exactly as printed, choosing whether they are per 100 g or per serving. The app converts everything to per 100 g internally, so any quantity you log in grams or servings gets the right totals.</p>
       <div class="foods-add-grid" style="margin-bottom:10px">
@@ -407,6 +415,17 @@ const REFERENCE_FOODS = [
   ["Dips & spreads", "Hummus", [166, 7.9, 14.3, 9.6, 1.4, 6, 0.3, 379], 30, "2 tbsp"],
 ];
 
+/* RECIPE LIBRARY
+   Each recipe lists its ingredients by the exact name of a food in REFERENCE_FOODS
+   (or a food already in your list), with the amount in grams or ml.
+   finalG = cooked weight of the whole dish (optional; defaults to total of ingredients).
+   portions = number of servings the dish makes. */
+const RECIPES = [
+  // Example format (not added):
+  // { name: "Dal tadka", category: "Recipes", finalG: 900, portions: 3,
+  //   ingredients: [["Toor dal, cooked", 400], ["Mustard oil", 10], ["Onion, raw", 110]] },
+];
+
 /* Starter foods. All values are PER 100 g or ml, with a typical serving size.
    These are approximate. Replace them with label values for your products. */
 function starter(id, name, per100, servingG, servingLabel) {
@@ -578,8 +597,31 @@ function addReferenceFoods() {
     });
     added++;
   });
+  // Recipes: resolve ingredient names to foods, then store them as editable recipes
+  let recipesAdded = 0;
+  const recipeProblems = [];
+  RECIPES.forEach(r => {
+    if (state.foods.some(f => f.name.toLowerCase() === r.name.toLowerCase())) return;
+    const items = r.ingredients.map(([foodName, grams]) => {
+      const f = state.foods.find(x => x.name.toLowerCase() === foodName.toLowerCase());
+      return f ? { foodId: f.id, qty: grams, unit: "g" } : null;
+    });
+    const missing = r.ingredients.filter((_, i) => !items[i]).map(([n]) => n);
+    if (missing.length) { recipeProblems.push(`${r.name} (missing: ${missing.join(", ")})`); return; }
+    const { grams, t } = recipeTotals(items);
+    const finalG = r.finalG || grams;
+    const portions = r.portions || 1;
+    state.foods.push({
+      id: uid(), name: r.name, category: r.category || "Recipes", source: "recipe (approximate)",
+      per100: scaleNut(t, 100 / finalG), servingG: finalG / portions, servingLabel: "portion",
+      notes: "Recipe", barcode: "",
+      recipe: { ingredients: items, finalG, portions },
+    });
+    recipesAdded++;
+  });
   saveState();
-  setFoodStatus(`Added ${added} reference foods. ${REFERENCE_FOODS.length - added} were already in your list.`);
+  setFoodStatus(`Added ${added} reference foods and ${recipesAdded} recipes. ${REFERENCE_FOODS.length - added} foods were already in your list.` +
+    (recipeProblems.length ? ` Recipes not added: ${recipeProblems.join("; ")}.` : ""));
   renderAll();
 }
 
@@ -1698,6 +1740,78 @@ function importCSV() {
     (skipped.length ? ` Skipped ${skipped.length} line(s) (${skipped.join(", ")}): missing name, bad number, or already in your list.` : "");
   renderAll();
 }
+
+/* ---- Paste label text: parse nutrition lines without a photo or AI ---- */
+function parseLabelText(raw) {
+  const src = raw.replace(/\r/g, " ");
+  const num = "(\\d+(?:\\.\\d+)?)";
+  const grab = (re, s = src) => { const m = s.match(re); return m ? parseFloat(m[1]) : null; };
+
+  // Remove sub-lines first so their numbers aren't mistaken for the main values
+  const noSubLines = src
+    .replace(new RegExp("saturated\\s*fat[^\\d\\n]*" + num + "\\s*g?", "ig"), " ")
+    .replace(new RegExp("trans\\s*fat[^\\d\\n]*" + num + "\\s*g?", "ig"), " ")
+    .replace(new RegExp("added\\s*sugars?[^\\d\\n]*" + num + "\\s*g?", "ig"), " ");
+
+  const sodiumMatch = src.match(new RegExp("sodium[^\\d\\n]*" + num + "\\s*(mg|g)?", "i"));
+  const sodium = sodiumMatch
+    ? parseFloat(sodiumMatch[1]) * (sodiumMatch[2] && sodiumMatch[2].toLowerCase() === "g" ? 1000 : 1)
+    : null;
+
+  const values = {
+    kcal: grab(new RegExp("calories?\\b[^\\d\\n]*" + num, "i")),
+    fat: grab(new RegExp("(?:total\\s*)?fat\\b[^\\d\\n]*" + num, "i"), noSubLines),
+    satFat: grab(new RegExp("saturated\\s*fat[^\\d\\n]*" + num, "i")),
+    carbs: grab(new RegExp("carbohydrates?[^\\d\\n]*" + num, "i")),
+    fiber: grab(new RegExp("(?:dietary\\s*)?fib(?:er|re)[^\\d\\n]*" + num, "i")),
+    sugar: grab(new RegExp("sugars?\\b[^\\d\\n]*" + num, "i"), noSubLines),
+    protein: grab(new RegExp("protein[^\\d\\n]*" + num, "i")),
+    sodium,
+    cholesterol: grab(new RegExp("cholesterol[^\\d\\n]*" + num, "i")),
+    calcium: grab(new RegExp("calcium[^\\d\\n]*" + num, "i")),
+    iron: grab(new RegExp("iron[^\\d\\n]*" + num, "i")),
+    potassium: grab(new RegExp("potassium[^\\d\\n]*" + num, "i")),
+    zinc: grab(new RegExp("zinc[^\\d\\n]*" + num, "i")),
+    magnesium: grab(new RegExp("magnesium[^\\d\\n]*" + num, "i")),
+  };
+
+  // Serving size, e.g. "Serving size 1 scoop (30 g)"
+  let servingG = null;
+  let servingLabel = null;
+  const servingLine = src.match(/serving\s*size[^\n]*/i);
+  if (servingLine) {
+    const g = servingLine[0].match(/\((\d+(?:\.\d+)?)\s*(?:g|ml)\)/i) || servingLine[0].match(/(\d+(?:\.\d+)?)\s*(?:g|ml)\b/i);
+    if (g) servingG = parseFloat(g[1]);
+    const label = servingLine[0].replace(/serving\s*size\s*:?\s*/i, "").split("(")[0].trim();
+    servingLabel = label || null;
+  }
+  const basis = /per\s*100\s*(?:g|ml)/i.test(src) ? "100" : "serving";
+  return { values, servingG, servingLabel, basis };
+}
+
+$("#paste-fill").addEventListener("click", () => {
+  const raw = $("#paste-label").value;
+  if (!raw.trim()) { $("#paste-status").textContent = "Paste the label text first."; return; }
+  const parsed = parseLabelText(raw);
+  const found = Object.values(parsed.values).filter(v => v !== null).length;
+  if (!found) {
+    $("#paste-status").textContent = "No nutrient values found. Check that the text includes lines like 'Protein 5 g'.";
+    return;
+  }
+  fillFoodForm({
+    name: $("#f-name").value,
+    basis: parsed.basis,
+    servingG: parsed.servingG,
+    servingLabel: parsed.servingLabel,
+    notes: `Pasted from label text (${parsed.basis === "100" ? "per 100 g" : "per serving"})`,
+    barcode: $("#f-barcode").value,
+    source: "pasted label text",
+    values: parsed.values,
+  });
+  const missingServing = parsed.basis === "serving" && !parsed.servingG;
+  $("#paste-status").textContent = `Filled ${found} values.` +
+    (missingServing ? " The serving size in grams wasn't found. Type it in before saving." : " Check them below, then Save food.");
+});
 
 $("#export-month").value = todayISO().slice(0, 7);
 $("#export-month-btn").addEventListener("click", exportMonthCSV);
